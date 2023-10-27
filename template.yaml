@@ -1,0 +1,298 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+AWSTemplateFormatVersion: 2010-09-09
+
+Transform: AWS::Serverless-2016-10-31
+
+Resources:
+
+  UpdateWebACLFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Architectures:
+        - arm64
+      Runtime: python3.10
+      Handler: index.lambda_handler
+      Timeout: 10
+      Policies:
+        - Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action: wafv2:UpdateWebACL
+            Resource: !Sub 'arn:aws:wafv2:${AWS::Region}:${AWS::AccountId}:*'
+      InlineCode: |
+
+        import json
+        import boto3
+        client = boto3.client("wafv2")
+
+
+        def lambda_handler(event, context):
+            print(json.dumps(event))
+            # Get the members for the update_web_acl method
+            update_members = client.meta.service_model.operation_model(
+                "UpdateWebACL"
+            ).input_shape.members
+
+            # Grab the shape of rule statement objects
+            rule_members = update_members['Rules']
+            statement_shapes = {}
+            for k,v in update_members['Rules'].member.members['Statement'].members.items():
+                statement_shapes[k] = [i for i in v.members.keys()]
+
+            # Get the keys within the event which are not supported in the method call
+            unsupported_keys = [k for k in event.keys() if k not in update_members.keys()]
+            # Delete the unsupported keys
+            for k in unsupported_keys:
+                print('deleting ' + k)
+                del event[k]
+            if event["Description"] == "":
+                del event["Description"]
+
+            # Enforce rule shapes according to the API spec
+            for rule in event['Rules']:
+                for key in rule['Statement']:
+                    expected_shape = statement_shapes[key]
+                    unsupported = [k for k in rule['Statement'][key] if k not in expected_shape]
+                    for k in unsupported:
+                        print('deleting ' + k)
+                        del rule['Statement'][key][k]
+
+
+            response = client.update_web_acl(**event)
+            return {"statusCode": 200, "body": json.dumps(response)}
+
+
+  UpdateACLStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Policies:
+        - Version: 2012-10-17
+          Statement:
+            - Effect: Allow
+              Action:
+                - ssm:getParameter
+              Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/wafthreat/config/*'
+            - Effect: Allow
+              Action:
+                - ssm:getParameter
+              Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/wafthreat/desired/*'
+            - Effect: Allow
+              Action:
+                - ssm:getParameter
+                - ssm:putParameter
+              Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/wafthreat/current/*'
+            - Effect: Allow
+              Action: s3:getObject
+              Resource: !Sub 'arn:${AWS::Partition}:s3:::*/*.json'
+            - Effect: Allow
+              Action: wafv2:getWebACL
+              Resource: '*'
+            - Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource: !GetAtt UpdateWebACLFunction.Arn
+      Events:
+        EBRule:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source:
+                - aws.ssm
+              detail-type:
+                - Parameter Store Change
+              detail:
+                name:
+                  - prefix: /wafthreat/desired/
+      DefinitionSubstitutions:
+        UpdateWebACLFunctionArn: !GetAtt UpdateWebACLFunction.Arn
+      Definition:
+        StartAt: ParseEvent
+        States:
+          ParseEvent:
+            Type: Pass
+            Parameters:
+              Parameters:
+                DesiredLevelName.$: $.detail.name
+                CurrentLevelName.$: States.Format('/{}/{}/{}',States.ArrayGetItem(States.StringSplit($.detail.name,'/'),0),'current',States.ArrayGetItem(States.StringSplit($.detail.name,'/'), 2))
+                ConfigName.$: States.Format('/{}/{}/{}',States.ArrayGetItem(States.StringSplit($.detail.name,'/'),0),'config',States.ArrayGetItem(States.StringSplit($.detail.name,'/'), 2))
+              Counter: 0
+            Next: GetParametersInParallel
+          GetParametersInParallel:
+            Type: Parallel
+            Branches:
+              - StartAt: GetConfig
+                States:
+                  GetConfig:
+                    Type: Task
+                    Resource: arn:aws:states:::aws-sdk:ssm:getParameter
+                    Parameters:
+                      Name.$: $.Parameters.ConfigName
+                    ResultPath: $.Config
+                    ResultSelector:
+                      ConfigValue.$: States.StringToJson($.Parameter.Value)
+                    End: True
+              - StartAt: GetCurrentLevel
+                States:
+                  GetCurrentLevel:
+                    Type: Task
+                    Resource: arn:aws:states:::aws-sdk:ssm:getParameter
+                    Parameters:
+                      Name.$: $.Parameters.CurrentLevelName
+                    ResultSelector:
+                      CurrentLevelValue.$: $.Parameter.Value
+                    End: True
+              - StartAt: GetDesiredLevel
+                States:
+                  GetDesiredLevel:
+                    Type: Task
+                    Resource: arn:aws:states:::aws-sdk:ssm:getParameter
+                    Parameters:
+                      Name.$: $.Parameters.DesiredLevelName
+                    ResultSelector:
+                      DesiredLevelValue.$: $.Parameter.Value
+                    End: True
+            Next: FlattenOutput
+          FlattenOutput:
+            Type: Pass
+            Parameters:
+              Parameters:
+                DesiredLevelName.$: $[0].Parameters.DesiredLevelName
+                DesiredLevelValue.$: $[2].DesiredLevelValue
+                CurrentLevelName.$: $[0].Parameters.CurrentLevelName
+                CurrentLevelValue.$: $[1].CurrentLevelValue
+                ConfigName.$: $[0].Parameters.ConfigName
+                ConfigValue.$: $[0].Config.ConfigValue
+              Counter.$: $[0].Counter
+              WebACL:
+                Name.$: States.ArrayGetItem(States.StringSplit($[0].Parameters.ConfigName,'/'), 2)
+                Scope.$: $[0].Config.ConfigValue.Scope
+            Next: CheckIfUpdateNeeded
+          CheckIfUpdateNeeded:
+            Type: Choice
+            Default: GetConfigFromS3
+            Choices:
+              - Next: DoNothing
+                Variable: $.Parameters.DesiredLevelValue
+                StringEqualsPath: $.Parameters.CurrentLevelValue
+          GetConfigFromS3:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:s3:getObject
+            Parameters:
+              Bucket.$: $.Parameters.ConfigValue.S3Bucket
+              Key.$: States.Format('{}-{}.json',$.WebACL.Name,$.Parameters.DesiredLevelValue)
+            ResultPath: $.DesiredConfig
+            ResultSelector:
+              ACL.$: States.StringToJson($.Body)
+            Next: GetCurrentWebACL
+          GetCurrentWebACL:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:wafv2:getWebACL
+            Parameters:
+              Id.$: $.DesiredConfig.ACL.Id
+              Name.$: $.DesiredConfig.ACL.Name
+              Scope.$: $.WebACL.Scope
+            ResultSelector:
+              LockToken.$: $.LockToken
+            ResultPath: $.CurrentConfig.ACL
+            Next: CallUpdateWebACL
+          CallUpdateWebACL:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters:
+              FunctionName: ${UpdateWebACLFunctionArn}
+              Payload.$: States.JsonMerge(States.JsonMerge($.DesiredConfig.ACL, $.CurrentConfig.ACL, false), $.WebACL, false)
+            Retry:
+              - ErrorEquals:
+                  - Lambda.ServiceException
+                  - Lambda.AWSLambdaException
+                  - Lambda.SdkClientException
+                IntervalSeconds: 2
+                MaxAttempts: 6
+                BackoffRate: 2
+            ResultPath: Null
+            Next: UpdateCurrentLevelParam
+          UpdateCurrentLevelParam:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:ssm:putParameter
+            Parameters:
+              Name.$: $.Parameters.CurrentLevelName
+              Value.$: $.Parameters.DesiredLevelValue
+              Overwrite: True
+            ResultPath: Null
+            Next: UpdateState
+          UpdateState:
+            Type: Pass
+            Parameters:
+              Parameters:
+                DesiredLevelName.$: $.Parameters.DesiredLevelName
+                DesiredLevelValue.$: $.Parameters.DesiredLevelValue
+                CurrentLevelName.$: $.Parameters.CurrentLevelName
+                CurrentLevelValue.$: $.Parameters.DesiredLevelValue
+                ConfigName.$: $.Parameters.ConfigName
+                ConfigValue.$: $.Parameters.ConfigValue
+              Counter.$: States.MathAdd($.Counter, 1)
+              WebACL.$: $.WebACL
+            Next: LoopCheck
+          LoopCheck:
+            Type: Choice
+            Default: ReCheckDesiredLevel
+            Choices:
+              - Next: Fail
+                Variable: $.Counter
+                NumericGreaterThan: 3
+          ReCheckDesiredLevel:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:ssm:getParameter
+            Parameters:
+              Name.$: $.Parameters.DesiredLevelName
+            ResultPath: $.DesiredLevelCheck
+            ResultSelector:
+              DesiredLevelValue.$: $.Parameter.Value
+            Next: MergeOutput
+          MergeOutput:
+            Type: Pass
+            Parameters:
+              Parameters:
+                DesiredLevelName.$: $.Parameters.DesiredLevelName
+                DesiredLevelValue.$: $.DesiredLevelCheck.DesiredLevelValue
+                CurrentLevelName.$: $.Parameters.CurrentLevelName
+                CurrentLevelValue.$: $.Parameters.CurrentLevelValue
+                ConfigName.$: $.Parameters.ConfigName
+                ConfigValue.$: $.Parameters.ConfigValue
+              Counter.$: $.Counter
+              WebACL.$: $.WebACL
+            Next: CheckIfUpdateNeeded
+          Fail:
+            Type: Fail
+            Error: WorkflowFailure
+            Cause: Tried to update WebACL more than three times without success
+          DoNothing:
+            Type: Succeed
+
+  SampleConfigParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Type: String
+      Name: /wafthreat/config/web-acl-name
+      Description: Sample WAF Threat Levels Config
+      Value: |
+        {
+          "S3Bucket":"my-webacl-bucket",
+          "Scope":"REGIONAL|CLOUDFRONT"
+        }
+
+  SampleDesiredParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Type: String
+      Name: /wafthreat/desired/web-acl-name
+      Description: Sample WAF Threat Levels - Desired Level
+      Value: 1|2|3
+
+  SampleCurrentParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Type: String
+      Name: /wafthreat/current/web-acl-name
+      Description: Sample WAF Threat Levels - Desired Level
+      Value: 1|2|3
