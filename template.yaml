@@ -1,7 +1,7 @@
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: MIT-0
 AWSTemplateFormatVersion: 2010-09-09
-
+Description: Threat Level Automation for AWS WAF (uksb-1tupboc31)
 Transform: AWS::Serverless-2016-10-31
 
 Resources:
